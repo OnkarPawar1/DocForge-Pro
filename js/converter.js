@@ -219,20 +219,162 @@ DocForge.Converter=(function(){
     };
   }
   function setupEpub2Pdf(upload,actions){
-    upload.innerHTML=`<div class="upload-zone" id="cv-epubUpload"><div class="upload-zone-icon">📚</div><div class="upload-zone-title">Drop EPUB file</div><input type="file" accept=".epub"></div>`;
+    upload.innerHTML=`<div class="upload-zone" id="cv-epubUpload"><div class="upload-zone-icon">📚</div><div class="upload-zone-title">Drop EPUB file</div><div class="upload-zone-subtitle">EPUB e-book files</div><input type="file" accept=".epub"></div>`;
     actions.innerHTML=`<button class="btn btn-primary" id="cv-epubConvert">📄 Convert to PDF</button>`;
-    let epubData=null;
-    DocForge.FileHandler.setupDropZone(upload.querySelector('#cv-epubUpload'),{accept:'.epub',onFile:async f=>{epubData=await DocForge.FileHandler.readAsArrayBuffer(f);DocForge.UI.toast('EPUB loaded','success');}});
+    const preview=document.getElementById('cv-preview');
+    let epubData=null,epubName='ebook';
+    DocForge.FileHandler.setupDropZone(upload.querySelector('#cv-epubUpload'),{accept:'.epub',onFile:async f=>{
+      epubData=await DocForge.FileHandler.readAsArrayBuffer(f);
+      epubName=f.name.replace(/\.epub$/i,'');
+      DocForge.UI.toast(`Loaded "${f.name}" (${DocForge.FileHandler.formatSize(f.size)})`,'success');
+    }});
     actions.querySelector('#cv-epubConvert').onclick=async()=>{
-      if(!epubData){DocForge.UI.toast('Upload EPUB','info');return;}
-      DocForge.UI.toast('Converting EPUB to PDF... this may take a moment','info');
-      const book=ePub(epubData);const div=document.createElement('div');div.style.cssText='width:550px;padding:30px;font-family:Georgia;background:#fff;color:#000;position:absolute;left:-9999px;';
-      document.body.appendChild(div);const rend=book.renderTo(div,{width:550,height:800});await rend.display();
-      setTimeout(async()=>{
-        const canvas=await html2canvas(div);document.body.removeChild(div);book.destroy();
-        const{jsPDF}=window.jspdf;const doc=new jsPDF();const w=doc.internal.pageSize.getWidth();const r=w/canvas.width;
-        doc.addImage(canvas.toDataURL(),'PNG',0,0,w,canvas.height*r);doc.save('ebook.pdf');DocForge.UI.toast('Converted!','success');
-      },2000);
+      if(!epubData){DocForge.UI.toast('Upload EPUB first','info');return;}
+      DocForge.UI.toast('Parsing EPUB and extracting chapters...','info');
+      if(preview)preview.innerHTML='<div style="text-align:center;padding:var(--space-lg);color:var(--text-secondary)"><div class="spinner" style="margin:0 auto var(--space-md)"></div>Extracting chapters...</div>';
+      try{
+        const zip=await JSZip.loadAsync(epubData);
+        // 1. Find OPF file via container.xml
+        const containerXml=await zip.file('META-INF/container.xml')?.async('text');
+        if(!containerXml)throw new Error('Invalid EPUB: missing container.xml');
+        const opfPath=(containerXml.match(/full-path="([^"]+)"/)||[])[1];
+        if(!opfPath)throw new Error('Cannot find OPF path');
+        const opfDir=opfPath.includes('/')?opfPath.substring(0,opfPath.lastIndexOf('/')+1):'';
+        // 2. Parse OPF to get spine order
+        const opfXml=await zip.file(opfPath)?.async('text');
+        if(!opfXml)throw new Error('Cannot read OPF file');
+        const parser=new DOMParser();
+        const opfDoc=parser.parseFromString(opfXml,'application/xml');
+        const manifest={};
+        opfDoc.querySelectorAll('manifest item').forEach(item=>{
+          manifest[item.getAttribute('id')]={href:item.getAttribute('href'),mediaType:item.getAttribute('media-type')};
+        });
+        const spineItems=[];
+        opfDoc.querySelectorAll('spine itemref').forEach(ref=>{
+          const id=ref.getAttribute('idref');
+          if(manifest[id])spineItems.push(manifest[id]);
+        });
+        // If no spine, try all HTML files from manifest
+        const htmlItems=spineItems.length>0?spineItems:
+          Object.values(manifest).filter(m=>m.mediaType&&(m.mediaType.includes('html')||m.mediaType.includes('xhtml')));
+        if(!htmlItems.length)throw new Error('No chapters found in EPUB');
+        // 3. Extract text from each chapter
+        const{jsPDF}=window.jspdf;
+        const doc=new jsPDF();
+        const pageW=doc.internal.pageSize.getWidth();
+        const pageH=doc.internal.pageSize.getHeight();
+        const margin=20;const textW=pageW-margin*2;
+        let isFirstPage=true;
+        // Try to get book title from OPF metadata
+        const titleEl=opfDoc.querySelector('metadata title');
+        const bookTitle=titleEl?titleEl.textContent:'';
+        if(bookTitle){
+          doc.setFontSize(22);doc.setFont('helvetica','bold');
+          doc.text(bookTitle,pageW/2,50,{align:'center'});
+          const authorEl=opfDoc.querySelector('metadata creator');
+          if(authorEl){doc.setFontSize(14);doc.setFont('helvetica','normal');doc.text(authorEl.textContent,pageW/2,65,{align:'center'});}
+          doc.setFontSize(10);doc.setFont('helvetica','normal');
+          doc.text('Converted by DocForge Pro',pageW/2,pageH-30,{align:'center'});
+          isFirstPage=false;
+        }
+        let totalChars=0;
+        for(let ci=0;ci<htmlItems.length;ci++){
+          const item=htmlItems[ci];
+          const filePath=opfDir+item.href;
+          const file=zip.file(filePath)||zip.file(item.href);
+          if(!file)continue;
+          const html=await file.async('text');
+          // Parse HTML and extract text
+          const chapterDoc=parser.parseFromString(html,'text/html');
+          // Process headings and paragraphs
+          const elements=chapterDoc.body?chapterDoc.body.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,blockquote,div,td,th,pre,span'):[];
+          let chapterText='';
+          const processed=new Set();
+          if(elements.length>0){
+            elements.forEach(el=>{
+              // Avoid duplicates from nested elements
+              let dominated=false;
+              for(const p of processed){if(p.contains(el)&&p!==el){dominated=true;break;}}
+              if(dominated)return;
+              const text=el.textContent.trim();
+              if(!text)return;
+              processed.add(el);
+              const tag=el.tagName.toLowerCase();
+              if(tag.match(/^h[1-6]$/)){chapterText+='\n##'+tag.charAt(1)+' '+text+'\n';}
+              else if(tag==='li'){chapterText+='• '+text+'\n';}
+              else{chapterText+=text+'\n\n';}
+            });
+          }else{
+            // Fallback: just get all text
+            chapterText=(chapterDoc.body?chapterDoc.body.textContent:'').trim();
+          }
+          chapterText=chapterText.replace(/\n{3,}/g,'\n\n').trim();
+          if(!chapterText)continue;
+          totalChars+=chapterText.length;
+          // Render to PDF
+          if(!isFirstPage)doc.addPage();
+          isFirstPage=false;
+          let y=margin;
+          const lines=chapterText.split('\n');
+          for(const line of lines){
+            const trimmed=line.trim();
+            if(!trimmed)continue;
+            // Headings
+            if(trimmed.startsWith('##')){
+              const level=parseInt(trimmed.charAt(2))||2;
+              const headingText=trimmed.replace(/^##\d\s*/,'');
+              const sizes={1:18,2:15,3:13,4:12,5:11,6:10};
+              const fontSize=sizes[level]||12;
+              if(y>pageH-margin-fontSize){doc.addPage();y=margin;}
+              y+=fontSize*0.5;
+              doc.setFontSize(fontSize);doc.setFont('helvetica','bold');
+              const wrapped=doc.splitTextToSize(headingText,textW);
+              for(const wl of wrapped){
+                if(y>pageH-margin){doc.addPage();y=margin;}
+                doc.text(wl,margin,y);y+=fontSize*0.5;
+              }
+              doc.setFont('helvetica','normal');
+              y+=4;
+            }
+            else if(trimmed.startsWith('• ')){
+              doc.setFontSize(10);
+              const bulletText=trimmed;
+              const wrapped=doc.splitTextToSize(bulletText,textW-5);
+              for(const wl of wrapped){
+                if(y>pageH-margin){doc.addPage();y=margin;}
+                doc.text(wl,margin+5,y);y+=5;
+              }
+              y+=1;
+            }
+            else{
+              doc.setFontSize(10);doc.setFont('helvetica','normal');
+              const wrapped=doc.splitTextToSize(trimmed,textW);
+              for(const wl of wrapped){
+                if(y>pageH-margin){doc.addPage();y=margin;}
+                doc.text(wl,margin,y);y+=5;
+              }
+              y+=2;
+            }
+          }
+          // Update preview
+          if(preview){preview.innerHTML=`<div style="text-align:center;padding:var(--space-md);color:var(--text-secondary)">Processing chapter ${ci+1}/${htmlItems.length}...</div>`;}
+        }
+        if(totalChars===0)throw new Error('No text content found in EPUB');
+        // Add page numbers
+        const pageCount=doc.internal.getNumberOfPages();
+        for(let i=1;i<=pageCount;i++){
+          doc.setPage(i);doc.setFontSize(8);doc.setTextColor(150);
+          doc.text(`${i} / ${pageCount}`,pageW/2,pageH-10,{align:'center'});
+          doc.setTextColor(0);
+        }
+        doc.save(epubName+'.pdf');
+        if(preview){preview.innerHTML=`<div class="card" style="text-align:center"><div style="font-size:var(--fs-2xl);margin-bottom:var(--space-sm)">✅</div><p style="font-weight:600">${epubName}.pdf</p><p style="color:var(--text-secondary);font-size:var(--fs-sm)">${pageCount} pages · ${htmlItems.length} chapters · ${Math.round(totalChars/1000)}K characters</p></div>`;}
+        DocForge.UI.toast(`Converted! ${pageCount} pages from ${htmlItems.length} chapters`,'success');
+      }catch(err){
+        console.error('EPUB conversion error:',err);
+        DocForge.UI.toast('Error: '+err.message,'error');
+        if(preview)preview.innerHTML=`<div class="card" style="color:var(--accent-rose)">❌ ${err.message}</div>`;
+      }
     };
   }
   function setupScreenshot(options,actions){
